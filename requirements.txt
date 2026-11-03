@@ -1,6 +1,6 @@
-streamlit
-yfinance
-pandas
-numpy
+streamlit==1.66.1
+yfinance==1.7.0
+pandas==3.1.0
+numpy==2.5.4
+altair==6.3.0
 requests
-altair
