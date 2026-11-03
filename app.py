@@ -1,4 +1,8 @@
 import html
+import json
+import tempfile
+import time
+from pathlib import Path
 import warnings
 import xml.etree.ElementTree as ET
 
@@ -71,14 +75,24 @@ PAIRS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "XAU/USD (zlato)": "GC=F",  # futures na zlato, dobrá náhrada spotu
+    "NQ (Nasdaq 100)": "NQ=F",  # futures na Nasdaq 100
 }
 # Futures se skutečným objemem (pro Volume POC)
 FUTURES = {
     "EUR/USD": "6E=F",
     "GBP/USD": "6B=F",
     "XAU/USD (zlato)": "GC=F",
+    "NQ (Nasdaq 100)": "NQ=F",
+}
+# Jednotky vzdáleností, desetinná místa a práh seasonality (v % za měsíc) pro každý instrument
+PAIR_SETTINGS = {
+    "EUR/USD": {"unit": 10000, "unit_label": "pips", "decimals": 4, "seas_threshold": 0.1},
+    "GBP/USD": {"unit": 10000, "unit_label": "pips", "decimals": 4, "seas_threshold": 0.1},
+    "XAU/USD (zlato)": {"unit": 1, "unit_label": "$", "decimals": 2, "seas_threshold": 0.3},
+    "NQ (Nasdaq 100)": {"unit": 1, "unit_label": "b.", "decimals": 2, "seas_threshold": 0.5},
 }
 DXY = "DX-Y.NYB"
+VIX = "^VIX"
 MONTHS = ["Led", "Úno", "Bře", "Dub", "Kvě", "Čvn", "Čvc", "Srp", "Zář", "Říj", "Lis", "Pro"]
 
 
@@ -364,11 +378,12 @@ def profile_chart(prof: dict, price: float, height: int = 260):
 # ---------------------------------------------------------------------------
 # COT, novinky, kalendář
 # ---------------------------------------------------------------------------
-# Kódy kontraktů CFTC: Euro FX, British Pound, Gold
+# Kódy kontraktů CFTC: Euro FX, British Pound, Gold, E-mini Nasdaq-100
 COT_CODES = {
     "EUR/USD": "099741",
     "GBP/USD": "096742",
     "XAU/USD (zlato)": "088691",
+    "NQ (Nasdaq 100)": "209742",
 }
 
 
@@ -400,6 +415,12 @@ PAIR_INFO = {
     "EUR/USD": {"ccy": "EUR", "base": [" eur ", " euro ", " ecb ", "lagarde", "eurozone", "euro zone"]},
     "GBP/USD": {"ccy": "GBP", "base": [" gbp ", " pound ", "sterling", " boe ", "bank of england", " uk "]},
     "XAU/USD (zlato)": {"ccy": None, "base": [" gold ", " xau ", "bullion"]},
+    # U akciového indexu silný dolar automaticky neznamená pokles, proto usd_inverse = False
+    "NQ (Nasdaq 100)": {
+        "ccy": None,
+        "base": [" nasdaq", " nq ", "tech stocks", "wall street", " s&p", "nvidia", "big tech", "us stocks"],
+        "usd_inverse": False,
+    },
 }
 USD_WORDS = [" usd ", "dollar", " fed ", "fomc", "powell", " dxy ", "treasury", " us "]
 BULL_WORDS = ["rise", "rises", "gain", "gains", "jump", "jumps", "climb", "climbs", "rally", "rallies",
@@ -436,11 +457,13 @@ def load_news() -> pd.DataFrame:
     return df.sort_values("time", ascending=False).reset_index(drop=True)
 
 
-def classify_headline(title: str, base_words: list):
+def classify_headline(title: str, base_words: list, usd_inverse: bool = True):
     """Vrátí (relevantní?, skóre -1/0/+1) podle slov v titulku. Hrubý odhad, ne AI."""
     text = f" {title.lower()} "
     is_base = any(w in text for w in base_words)
     is_usd = any(w in text for w in USD_WORDS)
+    if not usd_inverse:
+        is_usd = False  # u akciových indexů zprávy čistě o dolaru ignorujeme
     if not (is_base or is_usd):
         return False, 0
     raw = sum(w in text.split() or f" {w} " in text for w in BULL_WORDS) - sum(
@@ -456,14 +479,38 @@ def classify_headline(title: str, base_words: list):
     return True, 0
 
 
-@st.cache_data(ttl=3600)
+CALENDAR_URLS = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+]
+CALENDAR_CACHE = Path(tempfile.gettempdir()) / "leedge_calendar.json"
+CALENDAR_MAX_AGE = 3 * 3600  # kalendář se stahuje maximálně jednou za 3 hodiny
+
+
+def _fetch_calendar_json() -> list:
+    """Vrátí data kalendáře. Zdroj omezuje počet dotazů (chyba 429), proto se výsledek ukládá do souboru
+    a při chybě se použije poslední uložená kopie."""
+    if CALENDAR_CACHE.exists() and time.time() - CALENDAR_CACHE.stat().st_mtime < CALENDAR_MAX_AGE:
+        return json.loads(CALENDAR_CACHE.read_text())
+    last_error = None
+    for url in CALENDAR_URLS:
+        try:
+            response = requests.get(url, headers=HEADERS, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            CALENDAR_CACHE.write_text(json.dumps(data))
+            return data
+        except Exception as error:
+            last_error = error
+    if CALENDAR_CACHE.exists():  # zdroj neodpovídá, použijeme starší kopii
+        return json.loads(CALENDAR_CACHE.read_text())
+    raise last_error
+
+
+@st.cache_data(ttl=1800)
 def load_calendar() -> pd.DataFrame:
     """Týdenní ekonomický kalendář (volný feed ve formátu Forex Factory)."""
-    response = requests.get(
-        "https://nfs.faireconomy.media/ff_calendar_thisweek.json", headers=HEADERS, timeout=20
-    )
-    response.raise_for_status()
-    df = pd.DataFrame(response.json())
+    df = pd.DataFrame(_fetch_calendar_json())
     df["time"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert("Europe/Prague")
     for col in ["forecast", "previous"]:
         if col not in df:
@@ -501,8 +548,9 @@ if df.empty:
     st.error("Nepodařilo se stáhnout data. Zkus to za chvíli znovu.")
     st.stop()
 
-is_gold = "XAU" in pair
-unit, unit_label, decimals = (1, "$", 2) if is_gold else (10000, "pips", 4)
+settings = PAIR_SETTINGS[pair]
+unit, unit_label, decimals = settings["unit"], settings["unit_label"], settings["decimals"]
+is_index = pair.startswith("NQ")
 
 loading = st.empty()
 loading.info(f"Načítám data pro {pair}, první načtení trvá pár vteřin...")
@@ -517,14 +565,22 @@ last = float(df["Close"].iloc[-1])
 prev = float(df["Close"].iloc[-2])
 change = (last / prev - 1) * 100
 
-dxy = load(DXY, years=2)
+# Makro faktor: u měn a zlata dolar (DXY), u Nasdaqu index strachu (VIX)
+macro_key = "VIX" if is_index else "Dolar (DXY)"
+macro_label = "VIX (index strachu)" if is_index else "DXY (index dolaru)"
+macro = load(VIX if is_index else DXY, years=2)
 d_last = d_change = None
-if not dxy.empty:
-    d_last = float(dxy["Close"].iloc[-1])
-    d_change = (d_last / float(dxy["Close"].iloc[-2]) - 1) * 100
-    s = -sign(d_change, 0.1)  # slabý dolar = pro naše páry bullish
-    text = "Dolar slábne" if s > 0 else ("Dolar posiluje" if s < 0 else "Dolar beze změny")
-    signals["Dolar (DXY)"] = (s, f"{text} ({d_change:+.2f} %)")
+if not macro.empty:
+    d_last = float(macro["Close"].iloc[-1])
+    d_change = (d_last / float(macro["Close"].iloc[-2]) - 1) * 100
+    if is_index:
+        s = -sign(d_change, 3.0)  # klesající strach = pro akcie bullish
+        text = "Strach klesá" if s > 0 else ("Strach roste" if s < 0 else "VIX beze změny")
+        signals[macro_key] = (s, f"{text} ({d_change:+.1f} %)")
+    else:
+        s = -sign(d_change, 0.1)  # slabý dolar = pro naše páry bullish
+        text = "Dolar slábne" if s > 0 else ("Dolar posiluje" if s < 0 else "Dolar beze změny")
+        signals[macro_key] = (s, f"{text} ({d_change:+.2f} %)")
 
 # COT
 cot = None
@@ -550,7 +606,7 @@ seas = seasonality(df)
 this_month = MONTHS[pd.Timestamp.today().month - 1]
 if this_month in seas.index:
     value = float(seas[this_month])
-    signals["Seasonalita"] = (sign(value, 0.1), f"{this_month}: průměr {value:+.2f} %")
+    signals["Seasonalita"] = (sign(value, settings["seas_threshold"]), f"{this_month}: průměr {value:+.2f} %")
 
 # Novinky
 news_rows = []
@@ -558,7 +614,9 @@ news_total = 0
 try:
     news = load_news()
     for _, item in news.iterrows():
-        relevant, score = classify_headline(item["title"], PAIR_INFO[pair]["base"])
+        relevant, score = classify_headline(
+            item["title"], PAIR_INFO[pair]["base"], PAIR_INFO[pair].get("usd_inverse", True)
+        )
         if relevant:
             news_rows.append((item, score))
         if len(news_rows) >= 10:
@@ -660,7 +718,7 @@ def title_with_badge(title: str, key: str) -> str:
 top1, top2, top3, top4, top5 = st.columns([1, 1, 1, 1.4, 1.5])
 top1.metric(pair, f"{last:,.4f}" if last < 100 else f"{last:,.2f}", f"{change:+.2f} %")
 if d_last is not None:
-    top2.metric("DXY (index dolaru)", f"{d_last:.2f}", f"{d_change:+.2f} %")
+    top2.metric(macro_label, f"{d_last:.2f}", f"{d_change:+.2f} %")
 top3.metric("Poslední data", str(df.index[-1].date()))
 
 minutes_to_news = None
@@ -680,19 +738,26 @@ if minutes_to_news is not None and minutes_to_news <= 60:
 # Celkový obraz: souhrn a jednotlivé faktory
 # ---------------------------------------------------------------------------
 st.markdown("#### Celkový obraz")
-ORDER = ["Trend", "Dolar (DXY)", "COT", "Seasonalita", "Novinky", "London session", "Volume POC"]
+ORDER = ["Trend", macro_key, "COT", "Seasonalita", "Novinky", "London session", "Volume POC"]
 total = sum(score for score, _ in signals.values())
-gauge_col, factors_col = st.columns([1.5, 3])
-gauge_col.markdown(score_gauge(total, signals), unsafe_allow_html=True)
-with factors_col:
-    for start in (0, 4):
-        row = st.columns(4)
-        for column, name in zip(row, ORDER[start : start + 4]):
-            if name in signals:
-                score, text = signals[name]
-                column.markdown(glow_card(name, score, SIGNAL_LABELS[score], text), unsafe_allow_html=True)
-            else:
-                column.markdown(glow_card(name, 0, "n/a", "Data se nenačetla"), unsafe_allow_html=True)
+factor_cards = []
+for name in ORDER:
+    if name in signals:
+        score, text = signals[name]
+        factor_cards.append(glow_card(name, score, SIGNAL_LABELS[score], text))
+    else:
+        factor_cards.append(glow_card(name, 0, "n/a", "Data se nenačetla"))
+
+# Celý blok je jedna HTML mřížka, takže se karty nepřekrývají a na menší obrazovce se zalomí
+st.markdown(
+    "<div style='display:flex;flex-wrap:wrap;gap:14px;align-items:stretch;margin-bottom:10px'>"
+    f"<div style='flex:1.5 1 420px;display:flex'>{score_gauge(total, signals)}</div>"
+    "<div style='flex:3 1 560px;display:grid;gap:12px;"
+    "grid-template-columns:repeat(auto-fit,minmax(170px,1fr))'>"
+    + "".join(factor_cards)
+    + "</div></div>",
+    unsafe_allow_html=True,
+)
 st.caption(
     "Každý faktor dává ▲ bullish, ▼ bearish nebo ● neutrální podle jednoduchých pravidel. "
     "Slouží jako rychlá orientace, není to obchodní signál."
@@ -771,7 +836,8 @@ with right:
         with st.expander("Zbytek týdne"):
             st.dataframe(cal[["Den"] + cols], hide_index=True, use_container_width=True, height=300)
     except Exception as error:
-        st.warning(f"Kalendář se nepodařilo načíst: {error}")
+        hint = " Zdroj omezuje počet dotazů, zkus to za pár minut." if "429" in str(error) else ""
+        st.warning(f"Kalendář se nepodařilo načíst: {error}{hint}")
 
 # ---------------------------------------------------------------------------
 # Řádek 2: cena, seasonalita, COT
@@ -779,15 +845,19 @@ with right:
 col_price, col_seas, col_cot = st.columns(3)
 
 with col_price:
-    st.markdown(title_with_badge("Cena (90 dní) a dolar", "Dolar (DXY)"))
+    st.markdown(title_with_badge("Cena (90 dní) a " + ("VIX" if is_index else "dolar"), macro_key))
     line_chart(df["Close"].tail(90).to_frame("Cena"), height=200)
-    st.caption("Slábnoucí dolar (DXY dolů) je pro EUR/USD, GBP/USD i zlato bullish, posilující bearish.")
+    if is_index:
+        st.caption("Klesající VIX (méně strachu) je pro Nasdaq bullish, prudce rostoucí VIX bearish.")
+    else:
+        st.caption("Slábnoucí dolar (DXY dolů) je pro EUR/USD, GBP/USD i zlato bullish, posilující bearish.")
 
 with col_seas:
     st.markdown(title_with_badge("Seasonalita (10 let)", "Seasonalita"))
     st.bar_chart(seas, height=200, color=P["accent"])
     if "Seasonalita" in signals:
-        st.caption(f"{signals['Seasonalita'][1]}. Nad +0,1 % = bullish, pod -0,1 % = bearish.")
+        limit = f"{settings['seas_threshold']:.1f}".replace(".", ",")
+        st.caption(f"{signals['Seasonalita'][1]}. Nad +{limit} % = bullish, pod -{limit} % = bearish.")
 
 with col_cot:
     st.markdown(title_with_badge("COT: velcí spekulanti", "COT"))
