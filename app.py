@@ -86,10 +86,11 @@ FUTURES = {
 }
 # Jednotky vzdáleností, desetinná místa a práh seasonality (v % za měsíc) pro každý instrument
 PAIR_SETTINGS = {
-    "EUR/USD": {"unit": 10000, "unit_label": "pips", "decimals": 4, "seas_threshold": 0.1},
-    "GBP/USD": {"unit": 10000, "unit_label": "pips", "decimals": 4, "seas_threshold": 0.1},
-    "XAU/USD (zlato)": {"unit": 1, "unit_label": "$", "decimals": 2, "seas_threshold": 0.3},
-    "NQ (Nasdaq 100)": {"unit": 1, "unit_label": "b.", "decimals": 2, "seas_threshold": 0.5},
+    # round_step = vzdálenost mezi "kulatými čísly" (1.1200, 1.1250 ...), kolem kterých se cena často zastavuje
+    "EUR/USD": {"unit": 10000, "unit_label": "pips", "decimals": 4, "seas_threshold": 0.1, "round_step": 0.005},
+    "GBP/USD": {"unit": 10000, "unit_label": "pips", "decimals": 4, "seas_threshold": 0.1, "round_step": 0.005},
+    "XAU/USD (zlato)": {"unit": 1, "unit_label": "$", "decimals": 2, "seas_threshold": 0.3, "round_step": 10},
+    "NQ (Nasdaq 100)": {"unit": 1, "unit_label": "b.", "decimals": 2, "seas_threshold": 0.5, "round_step": 100},
 }
 DXY = "DX-Y.NYB"
 VIX = "^VIX"
@@ -204,8 +205,14 @@ def _to_london(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=900)
 def load_hourly(ticker: str) -> pd.DataFrame:
-    """Hodinové svíčky za posledních 10 dní, přepočtené na londýnský čas."""
-    return _to_london(_download(ticker, "10d", "1h"))
+    """Hodinové svíčky za posledních 6 měsíců (stačí na 4h EMA 200), přepočtené na londýnský čas."""
+    return _to_london(_download(ticker, "6mo", "1h"))
+
+
+@st.cache_data(ttl=900)
+def load_futures_hourly(ticker: str) -> pd.DataFrame:
+    """Hodinové svíčky futures se skutečným objemem za poslední 2 měsíce (pro relativní objem)."""
+    return _to_london(_download(ticker, "2mo", "1h"))
 
 
 @st.cache_data(ttl=900)
@@ -304,6 +311,97 @@ def estimate_delta(bars: pd.DataFrame):
     down = float(bars.loc[bars["Close"] < bars["Open"], "Volume"].sum())
     total = up + down
     return up - down, (up - down) / total if total > 0 else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Intraday pomocné funkce: trend ve více časových rámcích, 4h svíčky, týdny, VWAP, RVOL
+# ---------------------------------------------------------------------------
+def trend_state(close: pd.Series, fast: int, slow: int):
+    """Trend podle EMA: cena nad rychlou a rychlá nad pomalou = +1, opačně -1, jinak 0. Málo dat = None."""
+    close = close.dropna()
+    if len(close) < slow + 10:
+        return None
+    fast_ema = float(close.ewm(span=fast, adjust=False).mean().iloc[-1])
+    slow_ema = float(close.ewm(span=slow, adjust=False).mean().iloc[-1])
+    price = float(close.iloc[-1])
+    state = 1 if price > fast_ema > slow_ema else (-1 if price < fast_ema < slow_ema else 0)
+    return {"state": state, "fast": fast_ema, "slow": slow_ema, "fast_n": fast, "slow_n": slow}
+
+
+def to_4h(hourly: pd.DataFrame) -> pd.DataFrame:
+    """Složí 4h svíčky z hodinových (hranice v UTC: 00, 04, 08, 12, 16, 20)."""
+    utc = hourly.tz_convert("UTC")
+    bars = utc.resample("4h").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
+    return bars.dropna()
+
+
+def week_slices(hourly: pd.DataFrame):
+    """Rozdělí svíčky na aktuální a předchozí obchodní týden podle víkendové mezery v datech."""
+    gaps = hourly.index.to_series().diff() > pd.Timedelta(hours=36)
+    starts = list(hourly.index[gaps.values])
+    if not starts:
+        return hourly, hourly.iloc[0:0]
+    current = hourly[hourly.index >= starts[-1]]
+    if len(starts) > 1:
+        previous = hourly[(hourly.index >= starts[-2]) & (hourly.index < starts[-1])]
+    else:
+        previous = hourly[hourly.index < starts[-1]]
+    return current, previous
+
+
+def session_vwap(bars: pd.DataFrame):
+    """VWAP: průměrná cena vážená objemem (typická cena = (H + L + C) / 3)."""
+    bars = bars[bars["Volume"] > 0]
+    if bars.empty:
+        return None
+    typical = (bars["High"] + bars["Low"] + bars["Close"]) / 3
+    return float((typical * bars["Volume"]).sum() / bars["Volume"].sum())
+
+
+def round_levels(price: float, step: float):
+    """Nejbližší kulatá čísla pod a nad cenou."""
+    below = round(float(np.floor(price / step) * step), 6)
+    return below, round(below + step, 6)
+
+
+def relative_volume(fut_hourly: pd.DataFrame, days: int = 20):
+    """RVOL: objem od 08:00 London (před London open od půlnoci) do poslední dokončené hodiny
+    děleno průměrem stejného okna za předchozích `days` dní. 1.0 = běžný den."""
+    last_ts = fut_hourly.index[-1]
+    cut = last_ts.hour
+    start_h = 8 if cut >= 9 else 0
+    if cut <= start_h:
+        return None
+    volume = fut_hourly["Volume"]
+    window = volume[(volume.index.hour >= start_h) & (volume.index.hour < cut)]
+    by_day = window.groupby(window.index.date).sum()
+    today = last_ts.date()
+    if today not in by_day.index:
+        return None
+    history = by_day.drop(today)
+    history = history[history > 0].tail(days)
+    if len(history) < 5 or by_day[today] <= 0:
+        return None
+    return {"ratio": float(by_day[today] / history.mean()), "start": start_h, "end": cut, "days": len(history)}
+
+
+def stat_card(label: str, value: str, sub: str = "", color: str = None) -> str:
+    """Jednoduchá karta s číslem (vlastní HTML, aby se zobrazila i když se komponenty Streamlitu nenačtou)."""
+    color = color or "#e8efec"
+    return (
+        f"<div style=\"background:{P['card']};border:1px solid {P['border']};border-radius:10px;"
+        f"padding:8px 12px;height:100%;box-sizing:border-box\">"
+        f"<div style=\"font-size:0.8rem;color:{MUTED}\">{html.escape(label)}</div>"
+        f"<div style=\"font-size:1.3rem;font-weight:600;color:{color};line-height:1.35\">{html.escape(value)}</div>"
+        f"<div style=\"font-size:0.75rem;color:{MUTED}\">{html.escape(sub)}</div></div>"
+    )
+
+
+def card_grid(cards: list, min_width: int = 170) -> str:
+    return (
+        f"<div style='display:grid;gap:12px;margin-bottom:6px;"
+        f"grid-template-columns:repeat(auto-fit,minmax({min_width}px,1fr))'>" + "".join(cards) + "</div>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -645,13 +743,15 @@ except Exception as error:
 # Volume POC (z futures)
 prof = None
 poc_info = {}
+cur_bars = None
+fut_price = None
 try:
     intraday = load_intraday(FUTURES[pair])
     cur_bars, prev_bars = day_slices(intraday, day_start)
+    fut_price = float(intraday["Close"].iloc[-1])
     prof = volume_profile(prev_bars)
     if prof is None:
         raise ValueError("Za včerejšek nejsou k dispozici objemová data.")
-    fut_price = float(intraday["Close"].iloc[-1])
     delta, delta_ratio = estimate_delta(cur_bars if not cur_bars.empty else prev_bars)
     if fut_price > prof["vah"]:
         s, text = 1, "Cena nad value area"
@@ -668,15 +768,76 @@ except Exception as error:
     errors["Volume POC"] = str(error)
 
 
-# Trend (cena vůči EMA 50 a 200 na denním grafu)
-ema50 = float(df["Close"].ewm(span=50, adjust=False).mean().iloc[-1])
-ema200 = float(df["Close"].ewm(span=200, adjust=False).mean().iloc[-1])
-if last > ema50 > ema200:
-    signals["Trend"] = (1, "Cena nad EMA 50 i 200")
-elif last < ema50 < ema200:
-    signals["Trend"] = (-1, "Cena pod EMA 50 i 200")
-else:
-    signals["Trend"] = (0, "Smíšený trend")
+# Trend ve třech časových rámcích: týdenní (EMA 20/50), denní (EMA 50/200) a 4h (EMA 50/200)
+trend_tf = {
+    "W": trend_state(df["Close"].resample("W-FRI").last(), 20, 50),
+    "D": trend_state(df["Close"], 50, 200),
+    "4h": None,
+}
+if hourly is not None:
+    try:
+        trend_tf["4h"] = trend_state(to_4h(hourly)["Close"], 50, 200)
+    except Exception as error:
+        errors["Trend 4h"] = str(error)
+states = {k: (v["state"] if v else 0) for k, v in trend_tf.items()}
+# 4h rámec má dvojnásobnou váhu, protože nejlépe odpovídá intraday obchodování
+weighted_trend = 2 * states["4h"] + states["D"] + states["W"]
+trend_score = 1 if weighted_trend >= 2 else (-1 if weighted_trend <= -2 else 0)
+tf_symbol = {1: "▲", -1: "▼", 0: "●"}
+signals["Trend"] = (
+    trend_score,
+    " · ".join(
+        f"{name} {tf_symbol[states[key]] if trend_tf[key] else 'n/a'}"
+        for key, name in [("4h", "4h"), ("D", "D"), ("W", "W")]
+    ),
+)
+
+# Denní a týdenní open, VWAP, týdenní úrovně a kulatá čísla (ze spotových hodinových dat, VWAP z futures)
+levels = {}
+vwap_adj = None
+try:
+    if hourly is not None and lv is not None:
+        price_now = lv["price"]
+        day_now, day_prev = day_slices(hourly, day_start)
+        week_now, week_prev = week_slices(hourly)
+        levels["daily_open"] = float(day_now["Open"].iloc[0]) if not day_now.empty else None
+        levels["week_open"] = float(week_now["Open"].iloc[0]) if not week_now.empty else None
+        levels["prev_close"] = float(day_prev["Close"].iloc[-1]) if not day_prev.empty else None
+        levels["week_high"] = float(week_now["High"].max()) if not week_now.empty else None
+        levels["week_low"] = float(week_now["Low"].min()) if not week_now.empty else None
+        levels["pweek_high"] = float(week_prev["High"].max()) if not week_prev.empty else None
+        levels["pweek_low"] = float(week_prev["Low"].min()) if not week_prev.empty else None
+        levels["round_below"], levels["round_above"] = round_levels(price_now, settings["round_step"])
+
+        if cur_bars is not None and fut_price is not None and not cur_bars.empty:
+            vwap_fut = session_vwap(cur_bars)
+            if vwap_fut is not None:
+                # u měn je futures o pár pipů jinde než spot, proto VWAP posuneme o rozdíl
+                basis = 0.0 if PAIRS[pair] == FUTURES[pair] else price_now - fut_price
+                vwap_adj = vwap_fut + basis
+
+        comps = []
+        if levels["daily_open"] is not None:
+            comps.append(price_now - levels["daily_open"])
+        if vwap_adj is not None:
+            comps.append(price_now - vwap_adj)
+        if comps:
+            both = len(comps) == 2
+            if all(c > 0 for c in comps):
+                signals["Open / VWAP"] = (1, "Cena nad denním openem" + (" i VWAP" if both else ""))
+            elif all(c < 0 for c in comps):
+                signals["Open / VWAP"] = (-1, "Cena pod denním openem" + (" i VWAP" if both else ""))
+            else:
+                signals["Open / VWAP"] = (0, "Cena mezi openem a VWAP" if both else "Cena na denním openu")
+except Exception as error:
+    errors["Open / VWAP"] = str(error)
+
+# Relativní objem (RVOL) z hodinových futures
+rvol = None
+try:
+    rvol = relative_volume(load_futures_hourly(FUTURES[pair]))
+except Exception as error:
+    errors["RVOL"] = str(error)
 
 # ATR (průměrný denní pohyb za 14 dní)
 true_range = pd.concat(
@@ -738,7 +899,7 @@ if minutes_to_news is not None and minutes_to_news <= 60:
 # Celkový obraz: souhrn a jednotlivé faktory
 # ---------------------------------------------------------------------------
 st.markdown("#### Celkový obraz")
-ORDER = ["Trend", macro_key, "COT", "Seasonalita", "Novinky", "London session", "Volume POC"]
+ORDER = ["Trend", macro_key, "COT", "Seasonalita", "Novinky", "London session", "Volume POC", "Open / VWAP"]
 total = sum(score for score, _ in signals.values())
 factor_cards = []
 for name in ORDER:
@@ -797,7 +958,7 @@ with left:
             day_range = (lv["day_high"] - lv["day_low"]) * unit
             v2.metric("Dnešní pohyb", f"{day_range:.1f} {unit_label}")
             v3.metric("Využito ATR", f"{day_range / (atr * unit) * 100:.0f} %")
-        v4.metric("Trend (EMA 50/200)", SIGNAL_LABELS[signals["Trend"][0]])
+        v4.metric("Trend (W / D / 4h)", SIGNAL_LABELS[signals["Trend"][0]])
 
         frame = hourly["Close"].tail(48).to_frame("Cena")
         for label, key in [("Asia High", "asia_high"), ("Asia Low", "asia_low"),
@@ -838,6 +999,86 @@ with right:
     except Exception as error:
         hint = " Zdroj omezuje počet dotazů, zkus to za pár minut." if "429" in str(error) else ""
         st.warning(f"Kalendář se nepodařilo načíst: {error}{hint}")
+
+# ---------------------------------------------------------------------------
+# Řádek 1b: intraday kontext (trend, open, VWAP, úrovně, RVOL) a pak řádek 2: cena, seasonalita, COT
+# ---------------------------------------------------------------------------
+st.markdown(title_with_badge("Trend: týdenní, denní a 4h", "Trend"))
+trend_cards = []
+for key, name in [("W", "Týdenní"), ("D", "Denní"), ("4h", "4hodinový")]:
+    info = trend_tf.get(key)
+    if info is None:
+        trend_cards.append(stat_card(name, "n/a", "Málo dat nebo se nenačetla"))
+        continue
+    trend_cards.append(
+        stat_card(
+            f"{name} (EMA {info['fast_n']}/{info['slow_n']})",
+            SIGNAL_LABELS[info["state"]],
+            f"EMA {info['fast_n']}: {info['fast']:,.{decimals}f} · EMA {info['slow_n']}: {info['slow']:,.{decimals}f}",
+            SIGNAL_COLORS[info["state"]],
+        )
+    )
+bulls = sum(1 for v in states.values() if v > 0)
+bears = sum(1 for v in states.values() if v < 0)
+agree_sub = "převažuje nahoru" if trend_score > 0 else ("převažuje dolů" if trend_score < 0 else "rámce se rozcházejí")
+trend_cards.append(stat_card("Souhlas rámců", f"{max(bulls, bears)} ze 3", agree_sub, SIGNAL_COLORS[trend_score]))
+st.markdown(card_grid(trend_cards, 200), unsafe_allow_html=True)
+st.caption(
+    "Bullish = cena nad rychlou EMA a ta nad pomalou, bearish naopak, jinak neutrální. "
+    "4h trend má ve skóre dvojnásobnou váhu, protože nejlépe odpovídá intraday obchodování. "
+    "Když se rámce rozcházejí (např. týdenní nahoru a 4h dolů), jde obvykle o korekci."
+)
+
+st.markdown(title_with_badge("Open, VWAP a úrovně", "Open / VWAP"))
+if not levels or lv is None:
+    st.caption(f"Úrovně se nepodařilo načíst: {errors.get('Open / VWAP', 'chybí hodinová data')}")
+else:
+    price_now = lv["price"]
+
+    def level_card(name, level, colored=False, note=""):
+        if level is None:
+            return stat_card(name, "n/a", "Data nejsou k dispozici")
+        distance = (level - price_now) * unit
+        color = (SIGNAL_COLORS[1] if price_now > level else SIGNAL_COLORS[-1]) if colored else None
+        sub = f"{distance:+.1f} {unit_label} od ceny" + (f" · {note}" if note else "")
+        return stat_card(name, f"{level:,.{decimals}f}", sub, color)
+
+    if rvol is None:
+        rvol_card = stat_card("RVOL (relativní objem)", "n/a", errors.get("RVOL", "Málo dat o objemu"))
+    else:
+        ratio = rvol["ratio"]
+        if ratio >= 1.3:
+            rvol_text, rvol_color = "vysoká aktivita", P["accent"]
+        elif ratio <= 0.7:
+            rvol_text, rvol_color = "nízká aktivita, průrazy častěji selhávají", "#f0c05a"
+        else:
+            rvol_text, rvol_color = "běžná aktivita", None
+        rvol_card = stat_card(
+            "RVOL (relativní objem)",
+            f"{ratio:.2f}×",
+            f"{rvol_text}. Okno {rvol['start']:02d}:00-{rvol['end']:02d}:00 London, průměr {rvol['days']} dní",
+            rvol_color,
+        )
+
+    level_cards = [
+        level_card("Denní open", levels.get("daily_open"), True),
+        level_card("Týdenní open", levels.get("week_open"), True),
+        level_card("VWAP dnes", vwap_adj, True),
+        rvol_card,
+        level_card("Předchozí close", levels.get("prev_close")),
+        level_card("Týdenní High", levels.get("week_high")),
+        level_card("Týdenní Low", levels.get("week_low")),
+        level_card("Minulý týden High", levels.get("pweek_high")),
+        level_card("Minulý týden Low", levels.get("pweek_low")),
+        level_card("Kulaté číslo nad", levels.get("round_above")),
+        level_card("Kulaté číslo pod", levels.get("round_below")),
+    ]
+    st.markdown(card_grid(level_cards, 190), unsafe_allow_html=True)
+    st.caption(
+        "Open = první svíčka dne podle nastavení v bočním panelu. Zelená = cena je nad úrovní, červená = pod ní. "
+        f"VWAP je z futures {FUTURES[pair]} (skutečný objem) a u měn je přepočtený na spot. "
+        "RVOL nemá směr, jen říká, jak aktivní je trh, a do skóre nevstupuje."
+    )
 
 # ---------------------------------------------------------------------------
 # Řádek 2: cena, seasonalita, COT
